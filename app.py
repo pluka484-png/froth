@@ -161,9 +161,17 @@ table.pretty-table th, table.pretty-table td {{
 div[data-testid="stRadio"] > label {{
     display:none;
 }}
+div[data-testid="stRadio"] {{
+    display:flex;
+    justify-content:center;
+}}
 div[role="radiogroup"] {{
+    display:flex;
+    flex-wrap:wrap;
     gap:0.45rem;
     justify-content:center;
+    width:fit-content;
+    margin:0 auto;
 }}
 div[role="radiogroup"] label[data-baseweb="radio"] {{
     background:#ffffff;
