@@ -205,7 +205,14 @@ def p(name: str) -> str:
 
 
 def parse_date_series(values):
-    return pd.to_datetime(values, errors="coerce", utc=True).tz_localize(None)
+    parsed = pd.to_datetime(values, errors="coerce", utc=True)
+    if isinstance(parsed, pd.Series):
+        return parsed.dt.tz_localize(None)
+    if isinstance(parsed, pd.DatetimeIndex):
+        return parsed.tz_localize(None)
+    if isinstance(parsed, pd.Timestamp):
+        return parsed.tz_localize(None) if parsed.tzinfo is not None else parsed
+    return parsed
 
 
 @st.cache_data(show_spinner="Loading data files…")
