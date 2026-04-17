@@ -162,31 +162,34 @@ div[data-testid="stRadio"] > label {{
     display:none;
 }}
 div[data-testid="stRadio"] {{
-    display:flex;
-    justify-content:center;
+    width:100%;
 }}
-div[role="radiogroup"] {{
-    display:flex;
-    flex-wrap:wrap;
-    gap:0.45rem;
-    justify-content:center;
-    width:fit-content;
-    margin:0 auto;
+div[data-testid="stRadio"] > div {{
+    width:100%;
 }}
-div[role="radiogroup"] label[data-baseweb="radio"] {{
+div[data-testid="stRadio"] div[role="radiogroup"] {{
+    display:flex !important;
+    flex-wrap:wrap !important;
+    justify-content:center !important;
+    align-items:center !important;
+    gap:0.45rem !important;
+    width:100% !important;
+    margin:0 auto !important;
+}}
+div[data-testid="stRadio"] label[data-baseweb="radio"] {{
     background:#ffffff;
     border:1px solid {BORDER};
     border-radius:999px;
     padding:0.4rem 0.85rem;
 }}
-div[role="radiogroup"] label[data-baseweb="radio"]:has(input:checked) {{
+div[data-testid="stRadio"] label[data-baseweb="radio"]:has(input:checked) {{
     background:#eff6ff;
     border-color:#bfdbfe;
 }}
-div[role="radiogroup"] label[data-baseweb="radio"] > div {{
+div[data-testid="stRadio"] label[data-baseweb="radio"] > div {{
     gap:0.35rem;
 }}
-div[role="radiogroup"] label[data-baseweb="radio"] p {{
+div[data-testid="stRadio"] label[data-baseweb="radio"] p {{
     color:{TEXT};
     font-size:0.93rem;
     font-weight:700;
