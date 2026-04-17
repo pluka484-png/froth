@@ -194,6 +194,12 @@ div[data-testid="stRadio"] label[data-baseweb="radio"] p {{
     font-size:0.93rem;
     font-weight:700;
 }}
+div[data-testid="stTabs"] {{
+    display:flex !important;
+    justify-content:center !important;
+    flex-wrap:wrap !important;
+    gap:0.35rem !important;
+}}
 div[data-testid="stTabs"] button[role="tab"] {{
     min-height:48px;
     padding:0 16px;
