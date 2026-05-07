@@ -1059,6 +1059,47 @@ def render_downturn_heatmap_section(indicators, spx_c, selected, key_prefix="dow
 
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7. SHARED UI STATE
+# ══════════════════════════════════════════════════════════════════════════════
+def init_state(all_indicator_names):
+    names = list(all_indicator_names)
+    defaults = [
+        "Shiller CAPE",
+        "Tobin Q",
+        "Buffet Indicator",
+        "Froth Credit-to-GDP Gap",
+        "Froth Housing Momentum Gap",
+    ]
+    defaults = [x for x in defaults if x in names]
+    if not defaults:
+        defaults = names[:min(4, len(names))]
+
+    current = st.session_state.get("combo_selected")
+    if current is None:
+        st.session_state["combo_selected"] = defaults
+    else:
+        cleaned = [x for x in current if x in names]
+        st.session_state["combo_selected"] = cleaned if cleaned else defaults
+
+
+def render_shared_indicator_picker(all_indicator_names):
+    names = list(all_indicator_names)
+    current = [x for x in st.session_state.get("combo_selected", []) if x in names]
+    selected = st.multiselect(
+        "Selected indicators",
+        names,
+        default=current,
+        key="combo_selected_picker"
+    )
+    st.session_state["combo_selected"] = selected
+    return selected
+
+
+def get_combo_selected():
+    return list(st.session_state.get("combo_selected", []))
+
 def render_indicator_page(indicators, spx_c):
     st.subheader("Indicator Analysis")
     render_tab_intro(
