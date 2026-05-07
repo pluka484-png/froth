@@ -863,6 +863,45 @@ def get_spx_price_series(spx_c):
     return spx.copy()
 
 
+def get_regime_mask(technicals, merged, regime_mode="all"):
+    if regime_mode == "all":
+        return pd.Series(True, index=merged.index)
+
+    needed = {"Date", "Price", "SMA200"}
+    if technicals is None or not needed.issubset(set(technicals.columns)):
+        return pd.Series(True, index=merged.index)
+
+    tech = ensure_date_col(technicals)[["Date", "Price", "SMA200"]].copy()
+    tech["Price"] = pd.to_numeric(tech["Price"], errors="coerce")
+    tech["SMA200"] = pd.to_numeric(tech["SMA200"], errors="coerce")
+    tech = tech.dropna(subset=["Date", "Price", "SMA200"]).sort_values("Date")
+
+    if tech.empty or merged.empty or "Date" not in merged.columns:
+        return pd.Series(True, index=merged.index)
+
+    frame = merged[["Date"]].copy()
+    frame["_orig_index"] = merged.index
+    frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce", utc=True).dt.tz_localize(None)
+    frame = frame.dropna(subset=["Date"]).sort_values("Date")
+
+    aligned = pd.merge_asof(
+        frame,
+        tech,
+        on="Date",
+        direction="backward",
+        tolerance=pd.Timedelta(days=7),
+    ).set_index("_orig_index")
+
+    if regime_mode == "bull":
+        mask = aligned["Price"] > aligned["SMA200"]
+    elif regime_mode == "bear":
+        mask = aligned["Price"] < aligned["SMA200"]
+    else:
+        mask = pd.Series(True, index=aligned.index)
+
+    return mask.reindex(merged.index).fillna(False).astype(bool)
+
+
 def percentile_as_of(raw_df, value_col, anchor_date, value):
     hist = raw_df.loc[raw_df["Date"] <= anchor_date, value_col].dropna()
     if len(hist) < 10 or pd.isna(value):
