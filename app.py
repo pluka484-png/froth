@@ -1100,6 +1100,85 @@ def render_shared_indicator_picker(all_indicator_names):
 def get_combo_selected():
     return list(st.session_state.get("combo_selected", []))
 
+
+def render_tab_intro(title, body):
+    st.markdown(
+        f"""
+        <div class="info-card">
+            <div style="font-size:12px;font-weight:800;color:{TEXT};margin-bottom:4px;">{title}</div>
+            <div style="font-size:12px;color:{MUTED};line-height:1.45;">{body}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+def apply_layout(fig, title, height=420):
+    fig.update_layout(
+        template="plotly_white",
+        paper_bgcolor=BG,
+        plot_bgcolor=BG,
+        height=int(height),
+        margin=dict(l=50, r=30, t=58, b=42),
+        title=dict(text=title, x=0, font=dict(size=15, color=TEXT)),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        font=dict(color=TEXT),
+        hovermode="x unified",
+    )
+    fig.update_xaxes(showgrid=True, gridcolor=BORDER, zeroline=False, linecolor=BORDER)
+    fig.update_yaxes(showgrid=True, gridcolor=BORDER, zeroline=False, linecolor=BORDER)
+    return fig
+
+
+def _apply_rule(flags, selected, rule, n_val, composite_score, cutoff):
+    flags = pd.DataFrame(flags).fillna(False).astype(bool)
+    selected = [x for x in selected if x in flags.columns]
+    if not selected:
+        return pd.Series(False, index=flags.index), "No selected indicators"
+
+    if rule == "all":
+        return flags[selected].all(axis=1), "All selected indicators"
+    if rule == "at_least_n":
+        n_req = int(max(1, min(n_val, len(selected))))
+        return flags[selected].sum(axis=1) >= n_req, f"At least {n_req} selected indicators"
+    if rule == "composite":
+        return pd.Series(composite_score, index=flags.index).astype(float) >= float(cutoff), f"Composite >= {cutoff:.0%}"
+    return flags[selected].any(axis=1), "Any selected indicator"
+
+
+def mask_to_periods(dates, mask):
+    dates = pd.Series(pd.to_datetime(dates)).reset_index(drop=True)
+    mask = pd.Series(mask).fillna(False).astype(bool).reset_index(drop=True)
+    periods = []
+    start = None
+
+    for dt, is_on in zip(dates, mask):
+        if is_on and start is None:
+            start = dt
+        elif not is_on and start is not None:
+            periods.append((start, prev_dt))
+            start = None
+        prev_dt = dt
+
+    if start is not None and len(dates):
+        periods.append((start, dates.iloc[-1]))
+
+    return periods
+
+
+def mask_to_starts(dates, mask):
+    dates = pd.Series(pd.to_datetime(dates)).reset_index(drop=True)
+    mask = pd.Series(mask).fillna(False).astype(bool).reset_index(drop=True)
+    starts = []
+    prev_on = False
+
+    for dt, is_on in zip(dates, mask):
+        if is_on and not prev_on:
+            starts.append(dt)
+        prev_on = bool(is_on)
+
+    return starts
+
 def render_indicator_page(indicators, spx_c):
     st.subheader("Indicator Analysis")
     render_tab_intro(
