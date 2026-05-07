@@ -22,9 +22,6 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.tree import DecisionTreeClassifier, export_text
 
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -64,39 +61,15 @@ INVERSE_INDICATORS = [
     "AAII Bullish",
     "BB Lower",
     "SPX SMA200",
+    "Froth Yield Curve",
+    "Froth Real Policy Rate",
+    "Froth Current Account (3Y Avg)",
+    "Froth Fiscal Deficit",
+    "Froth IPO Median Age",
 ]
 
-WF_WARMUP_DAYS = 252
-WF_ALERT_THRESHOLD = 0.10
-WF_RESET_DAYS = 21
-WF_SMOOTH_DAYS = 20
-WF_SAMPLE_START_DATE = "1993-01-01"
-WF_MIN_TEST_ROWS = 63
-WF_MIN_TRAIN_ROWS = 252 * 3
-WF_N_FOLDS = 4
-WF_MAX_COMBO_SIZE = 4
-ML_INNER_OOF_SPLITS = 3
-ML_MAX_MISSING_FEATURE_FRAC = 0.35
-ML_RANDOM_STATE = 42
-ML_RF_N_ESTIMATORS = 300
-ML_RF_MAX_DEPTH = 5
-ML_RF_MIN_SAMPLES_LEAF = 10
-ML_TREE_MAX_DEPTH = 4
-ML_TREE_MIN_SAMPLES_LEAF = 10
-ML_MIN_FOLDS_REQUIRED = 2
-ML_N_FINALISTS = 12
-ML_TOP_COMBOS = 12
-REGIME_AUGMENT_CANDIDATES = [
-    "Shiller CAPE",
-    "Tobin Q",
-    "PB Ratio",
-    "PE Ratio",
-    "PS Ratio",
-    "Buffet Indicator",
-    "Earnings Yield",
-    "Dividend Yield",
-    "Equity Valuation (OFR)",
-]
+GMD_START_YEAR = 1880
+GMD_END_YEAR = 2026
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -158,48 +131,6 @@ table.pretty-table th, table.pretty-table td {{
     padding:8px 10px;
     border-bottom:1px solid {BORDER};
 }}
-div[data-testid="stRadio"] > label {{
-    display:none;
-}}
-div[data-testid="stRadio"] {{
-    width:100%;
-}}
-div[data-testid="stRadio"] > div {{
-    width:100%;
-}}
-div[data-testid="stRadio"] div[role="radiogroup"] {{
-    display:flex !important;
-    flex-wrap:wrap !important;
-    justify-content:center !important;
-    align-items:center !important;
-    gap:0.45rem !important;
-    width:100% !important;
-    margin:0 auto !important;
-}}
-div[data-testid="stRadio"] label[data-baseweb="radio"] {{
-    background:#ffffff;
-    border:1px solid {BORDER};
-    border-radius:999px;
-    padding:0.4rem 0.85rem;
-}}
-div[data-testid="stRadio"] label[data-baseweb="radio"]:has(input:checked) {{
-    background:#eff6ff;
-    border-color:#bfdbfe;
-}}
-div[data-testid="stRadio"] label[data-baseweb="radio"] > div {{
-    gap:0.35rem;
-}}
-div[data-testid="stRadio"] label[data-baseweb="radio"] p {{
-    color:{TEXT};
-    font-size:0.93rem;
-    font-weight:700;
-}}
-div[data-testid="stTabs"] {{
-    display:flex !important;
-    justify-content:center !important;
-    flex-wrap:wrap !important;
-    gap:0.35rem !important;
-}}
 div[data-testid="stTabs"] button[role="tab"] {{
     min-height:48px;
     padding:0 16px;
@@ -230,6 +161,296 @@ def parse_date_series(values):
     if isinstance(parsed, pd.Timestamp):
         return parsed.tz_localize(None) if parsed.tzinfo is not None else parsed
     return parsed
+
+
+def safe_divide(num, den):
+    num_s = pd.Series(num, copy=False, dtype=float)
+    den_s = pd.Series(den, copy=False, dtype=float)
+    out = num_s / den_s.replace(0, np.nan)
+    return out.replace([np.inf, -np.inf], np.nan)
+
+
+def standardize_full_sample(series):
+    s = pd.Series(series, dtype=float)
+    mean = s.mean(skipna=True)
+    std = s.std(skipna=True, ddof=0)
+    if pd.isna(std) or std == 0:
+        return pd.Series(np.nan, index=s.index, dtype=float)
+    return (s - mean) / std
+
+
+def hp_filter_cycle(series, lamb=6.25):
+    s = pd.Series(series, dtype=float)
+    valid = s.dropna()
+    if len(valid) < 5:
+        return pd.Series(np.nan, index=s.index, dtype=float)
+
+    y = np.log(valid.to_numpy(dtype=float))
+    n = len(y)
+    d = np.zeros((n - 2, n))
+    idx = np.arange(n - 2)
+    d[idx, idx] = 1.0
+    d[idx, idx + 1] = -2.0
+    d[idx, idx + 2] = 1.0
+
+    trend = np.linalg.solve(np.eye(n) + lamb * (d.T @ d), y)
+    cycle = pd.Series(np.nan, index=s.index, dtype=float)
+    cycle.loc[valid.index] = 100.0 * (y - trend)
+    return cycle
+
+
+def build_us_gmd_frame(gmd_raw, country="United States", start_year=GMD_START_YEAR, end_year=GMD_END_YEAR):
+    us = gmd_raw.loc[
+        (gmd_raw["countryname"] == country) &
+        (gmd_raw["year"] >= start_year) &
+        (gmd_raw["year"] <= end_year)
+    ].copy()
+    us["year"] = pd.to_numeric(us["year"], errors="coerce")
+    us = us.dropna(subset=["year"]).sort_values("year").reset_index(drop=True)
+    us["year"] = us["year"].astype(int)
+    us["Date"] = pd.to_datetime(us["year"].astype(str) + "-12-31", errors="coerce")
+
+    numeric_cols = [c for c in us.columns if c not in {"countryname", "ISO3", "id", "income_group", "Date"}]
+    for col in numeric_cols:
+        us[col] = pd.to_numeric(us[col], errors="coerce")
+
+    return us
+
+
+def load_loans_to_nonfin():
+    for filename in ["loans_to_nonfin.csv", "loands_to_nonfin.csv"]:
+        file_path = p(filename)
+        if os.path.exists(file_path):
+            raw = pd.read_csv(file_path)
+            raw.columns = [str(c).strip() for c in raw.columns]
+            date_col = next((c for c in raw.columns if c.lower() in {"date", "observation_date"}), raw.columns[0])
+            value_candidates = [c for c in raw.columns if c != date_col]
+            value_col = value_candidates[0] if value_candidates else None
+            if value_col is None:
+                return pd.DataFrame(columns=["Date", "Value"])
+            out = raw[[date_col, value_col]].rename(columns={date_col: "Date", value_col: "Value"}).copy()
+            out["Date"] = parse_date_series(out["Date"])
+            out["Value"] = pd.to_numeric(out["Value"], errors="coerce")
+            return out.dropna(subset=["Date", "Value"]).sort_values("Date").reset_index(drop=True)
+    return pd.DataFrame(columns=["Date", "Value"])
+
+
+def build_nonfinancial_loan_indicators(us_gmd, loans_to_nonfin):
+    if loans_to_nonfin is None or loans_to_nonfin.empty:
+        return {}
+
+    base = us_gmd[["Date", "nGDP", "ltrate"]].copy().sort_values("Date")
+    loans = loans_to_nonfin[["Date", "Value"]].copy().sort_values("Date")
+    aligned = pd.merge_asof(
+        loans,
+        base,
+        on="Date",
+        direction="backward",
+        tolerance=pd.Timedelta(days=460)
+    )
+    debt_service = safe_divide(aligned["Value"] * 1000.0 * (aligned["ltrate"] / 100.0), aligned["nGDP"])
+    loan_qoq_growth = aligned["Value"].pct_change(fill_method=None) * 100.0
+
+    return {
+        "Froth Nonfinancial Debt Service": pd.DataFrame({"Date": aligned["Date"], "Value": debt_service}),
+        "Froth Nonfinancial Loan Acceleration": pd.DataFrame({"Date": aligned["Date"], "Value": loan_qoq_growth.diff()}),
+    }
+
+
+def build_global_gmd_indicators(gmd_raw, excluded_country="United States", start_year=GMD_START_YEAR,
+                                end_year=GMD_END_YEAR, gdp_coverage=0.90, min_countries=5):
+    panel = gmd_raw.copy()
+    panel["year"] = pd.to_numeric(panel["year"], errors="coerce")
+    panel = panel.loc[
+        (panel["countryname"] != excluded_country) &
+        (panel["year"] >= start_year) &
+        (panel["year"] <= end_year)
+    ].copy()
+
+    for col in ["M3", "nGDP", "nGDP_USD", "ltrate", "strate"]:
+        panel[col] = pd.to_numeric(panel[col], errors="coerce")
+
+    panel = panel.sort_values(["countryname", "year"]).reset_index(drop=True)
+    panel["credit_to_gdp"] = safe_divide(panel["M3"], panel["nGDP"])
+    panel["credit_to_gdp_growth"] = panel.groupby("countryname")["credit_to_gdp"].pct_change(fill_method=None) * 100.0
+    panel["yield_curve_slope"] = panel["ltrate"] - panel["strate"]
+
+    def gdp_weighted_top_coverage(frame, value_col):
+        valid = frame.dropna(subset=[value_col, "nGDP_USD"]).copy()
+        valid = valid.loc[valid["nGDP_USD"] > 0].sort_values("nGDP_USD", ascending=False)
+        if len(valid) < min_countries:
+            return pd.Series({"Value": np.nan, "n_countries": int(len(valid)), "gdp_coverage": np.nan})
+
+        total_gdp = valid["nGDP_USD"].sum()
+        valid["cum_gdp_share"] = valid["nGDP_USD"].cumsum() / total_gdp
+        cutoff = valid["cum_gdp_share"] <= float(gdp_coverage)
+        cutoff.iloc[0] = True
+        if cutoff.sum() < min(min_countries, len(valid)):
+            cutoff.iloc[:min(min_countries, len(valid))] = True
+        selected = valid.loc[cutoff].copy()
+        weights = selected["nGDP_USD"] / selected["nGDP_USD"].sum()
+        return pd.Series({
+            "Value": float((selected[value_col] * weights).sum()),
+            "n_countries": int(len(selected)),
+            "gdp_coverage": float(selected["nGDP_USD"].sum() / total_gdp),
+        })
+
+    global_credit = (
+        panel.dropna(subset=["year", "credit_to_gdp_growth"])
+        .groupby("year")
+        .apply(lambda x: gdp_weighted_top_coverage(x, "credit_to_gdp_growth"))
+        .reset_index()
+    )
+    global_credit["Date"] = pd.to_datetime(global_credit["year"].astype(int).astype(str) + "-12-31", errors="coerce")
+
+    global_slope = (
+        panel.dropna(subset=["year", "yield_curve_slope"])
+        .groupby("year")
+        .apply(lambda x: gdp_weighted_top_coverage(x, "yield_curve_slope"))
+        .reset_index()
+    )
+    global_slope["Date"] = pd.to_datetime(global_slope["year"].astype(int).astype(str) + "-12-31", errors="coerce")
+
+    return {
+        "Froth Global Credit Growth ex-US": global_credit[["Date", "Value"]].sort_values("Date").reset_index(drop=True),
+        "Froth Global Yield Curve ex-US": global_slope[["Date", "Value"]].sort_values("Date").reset_index(drop=True),
+        "global_credit_growth_ex_us_details": global_credit[["Date", "n_countries", "gdp_coverage"]].sort_values("Date").reset_index(drop=True),
+        "global_yield_curve_ex_us_details": global_slope[["Date", "n_countries", "gdp_coverage"]].sort_values("Date").reset_index(drop=True),
+    }
+
+
+def build_ipo_froth_indicators():
+    rows = [
+        (1980, 71, 6, 23, 32, 1, 1, 22, 64), (1981, 192, 8, 53, 28, 1, 1, 72, 40),
+        (1982, 77, 5, 21, 27, 2, 3, 42, 36), (1983, 451, 7, 116, 26, 17, 4, 173, 39),
+        (1984, 171, 8, 44, 26, 5, 3, 50, 52), (1985, 186, 9, 39, 21, 18, 10, 37, 43),
+        (1986, 393, 8, 79, 20, 42, 11, 77, 40), (1987, 285, 8, 66, 23, 41, 14, 59, 66),
+        (1988, 105, 8, 32, 30, 9, 9, 28, 61), (1989, 116, 8, 40, 34, 10, 9, 35, 66),
+        (1990, 110, 9, 42, 38, 13, 12, 32, 75), (1991, 286, 10, 115, 40, 73, 26, 71, 63),
+        (1992, 412, 10, 138, 33, 98, 24, 115, 58), (1993, 510, 9, 172, 34, 79, 15, 127, 69),
+        (1994, 402, 9, 129, 32, 22, 5, 115, 56), (1995, 462, 8, 190, 41, 30, 6, 205, 56),
+        (1996, 677, 8, 266, 39, 34, 5, 276, 56), (1997, 474, 10, 134, 28, 38, 8, 174, 42),
+        (1998, 283, 9, 80, 28, 30, 11, 113, 49), (1999, 476, 5, 280, 59, 30, 6, 370, 68),
+        (2000, 380, 6, 245, 64, 32, 8, 261, 70), (2001, 80, 12, 32, 40, 21, 26, 24, 70),
+        (2002, 66, 15, 23, 35, 20, 30, 20, 65), (2003, 63, 11, 25, 40, 21, 33, 18, 67),
+        (2004, 173, 8, 79, 46, 43, 25, 61, 66), (2005, 159, 13, 45, 28, 68, 43, 45, 49),
+        (2006, 157, 13, 56, 36, 66, 42, 48, 56), (2007, 159, 9, 79, 50, 30, 19, 76, 76),
+        (2008, 21, 14, 9, 43, 3, 14, 6, 67), (2009, 41, 15, 12, 29, 19, 46, 14, 43),
+        (2010, 91, 11, 40, 44, 28, 31, 33, 73), (2011, 81, 11, 46, 57, 18, 22, 36, 83),
+        (2012, 93, 12, 49, 53, 28, 30, 40, 87), (2013, 158, 12, 81, 52, 37, 23, 45, 78),
+        (2014, 206, 11, 132, 64, 38, 18, 53, 75), (2015, 118, 10, 78, 65, 20, 17, 38, 76),
+        (2016, 75, 10, 49, 65, 13, 17, 21, 71), (2017, 106, 12, 64, 60, 19, 18, 30, 80),
+        (2018, 134, 10, 91, 68, 15, 11, 39, 77), (2019, 113, 10, 77, 69, 11, 10, 37, 70),
+        (2020, 165, 9, 113, 68, 22, 13, 46, 73), (2021, 311, 11, 175, 56, 67, 22, 121, 64),
+        (2022, 38, 8, 14, 37, 0, 0, 6, 17), (2023, 54, 10, 23, 43, 5, 9, 9, 44),
+        (2024, 72, 14, 37, 51, 13, 18, 14, 57), (2025, 90, 12, 49, 54, 14, 16, 31, 74),
+    ]
+    ipo = pd.DataFrame(rows, columns=[
+        "year", "ipo_count", "median_age", "vc_backed_count", "vc_backed_pct",
+        "buyout_backed_count", "buyout_backed_pct", "technology_count", "tech_vc_backed_pct"
+    ])
+    ipo["Date"] = pd.to_datetime(ipo["year"].astype(str) + "-12-31", errors="coerce")
+    ipo["technology_pct"] = safe_divide(ipo["technology_count"], ipo["ipo_count"]) * 100.0
+    ipo["ipo_count_yoy_growth"] = ipo["ipo_count"].pct_change(fill_method=None) * 100.0
+    ipo["vc_backed_count_yoy_growth"] = ipo["vc_backed_count"].pct_change(fill_method=None) * 100.0
+    return {
+        "Froth IPO Count": pd.DataFrame({"Date": ipo["Date"], "Value": ipo["ipo_count"]}),
+        "Froth IPO Count YoY Growth": pd.DataFrame({"Date": ipo["Date"], "Value": ipo["ipo_count_yoy_growth"]}),
+        "Froth IPO Median Age": pd.DataFrame({"Date": ipo["Date"], "Value": ipo["median_age"]}),
+        "Froth VC-Backed IPO Share": pd.DataFrame({"Date": ipo["Date"], "Value": ipo["vc_backed_pct"]}),
+        "Froth VC-Backed IPO Count Growth": pd.DataFrame({"Date": ipo["Date"], "Value": ipo["vc_backed_count_yoy_growth"]}),
+        "Froth Buyout-Backed IPO Share": pd.DataFrame({"Date": ipo["Date"], "Value": ipo["buyout_backed_pct"]}),
+        "Froth Technology IPO Count": pd.DataFrame({"Date": ipo["Date"], "Value": ipo["technology_count"]}),
+        "Froth Technology IPO Share": pd.DataFrame({"Date": ipo["Date"], "Value": ipo["technology_pct"]}),
+        "Froth VC-Backed Technology IPO Share": pd.DataFrame({"Date": ipo["Date"], "Value": ipo["tech_vc_backed_pct"]}),
+        "ipo_issuance_details": ipo,
+    }
+
+
+def monthly_returns_from_price(price_df, value_col="Value"):
+    monthly = price_df[["Date", value_col]].copy()
+    monthly["Date"] = parse_date_series(monthly["Date"])
+    monthly[value_col] = pd.to_numeric(monthly[value_col], errors="coerce")
+    monthly = monthly.dropna(subset=["Date", value_col]).sort_values("Date")
+    monthly = monthly.set_index("Date")[value_col].resample("ME").last().dropna()
+    return monthly.pct_change(fill_method=None).dropna()
+
+
+def rolling_volatility_ratio(returns, short_window=3, long_window=24):
+    short_vol = returns.rolling(short_window, min_periods=short_window).std()
+    long_vol = returns.rolling(long_window, min_periods=long_window).std()
+    return safe_divide(short_vol, long_vol)
+
+
+def rolling_capm_residual_volatility(asset_returns, market_returns, window=36, annualize=True):
+    aligned = pd.concat([asset_returns.rename("asset"), market_returns.rename("market")], axis=1).dropna()
+    out = pd.Series(np.nan, index=aligned.index, dtype=float)
+    scale = np.sqrt(12.0) if annualize else 1.0
+    for end in range(window - 1, len(aligned)):
+        sample = aligned.iloc[end - window + 1:end + 1]
+        market_var = sample["market"].var(ddof=1)
+        if pd.isna(market_var) or market_var == 0:
+            continue
+        beta = sample["asset"].cov(sample["market"]) / market_var
+        alpha = sample["asset"].mean() - beta * sample["market"].mean()
+        residuals = sample["asset"] - alpha - beta * sample["market"]
+        out.iloc[end] = residuals.std(ddof=1) * scale * 100.0
+    return out
+
+
+def build_fama_volatility_indicators(market_price_df, industry_price_df=None, industry_label="Industry"):
+    market_returns = monthly_returns_from_price(market_price_df)
+    market_vol = market_returns.rolling(36, min_periods=36).std() * np.sqrt(12.0) * 100.0
+    market_vol_ratio = rolling_volatility_ratio(market_returns, short_window=3, long_window=24)
+    out = {
+        "Froth SPX 36M Volatility": pd.DataFrame({"Date": market_vol.index, "Value": market_vol.to_numpy()}),
+        "Froth SPX Volatility Ratio (3M/24M)": pd.DataFrame({"Date": market_vol_ratio.index, "Value": market_vol_ratio.to_numpy()}),
+    }
+    if industry_price_df is not None:
+        industry_returns = monthly_returns_from_price(industry_price_df)
+        residual_vol = rolling_capm_residual_volatility(industry_returns, market_returns, window=36, annualize=True)
+        out[f"Froth {industry_label} Residual Volatility (36M)"] = pd.DataFrame({
+            "Date": residual_vol.index,
+            "Value": residual_vol.to_numpy(),
+        })
+    return out
+
+
+def build_us_froth_indicators(us_gmd, loans_to_nonfin=None):
+    base = us_gmd.copy().sort_values("Date").reset_index(drop=True)
+    combined_consumption = base["hcons"] + base["gcons"]
+    hpi_yoy = base["HPI"].pct_change(fill_method=None)
+    hpi_3y_annualized = safe_divide(base["HPI"], base["HPI"].shift(3)).pow(1.0 / 3.0) - 1.0
+    hpi_2y_return = safe_divide(base["HPI"], base["HPI"].shift(2)) - 1.0
+    hpi_first_year_return = safe_divide(base["HPI"].shift(1), base["HPI"].shift(2)) - 1.0
+    out = {"us_gmd": base.copy()}
+
+    series_map = {
+        "Froth Real M2 Growth": (base["M2"].pct_change(fill_method=None) * 100) - base["infl"],
+        "Froth Real M3 Growth": (base["M3"].pct_change(fill_method=None) * 100) - base["infl"],
+        "Froth Credit-to-GDP Gap": safe_divide(base["M3"], base["nGDP"]) - safe_divide(base["M3"], base["nGDP"]).rolling(10, min_periods=10).mean(),
+        "Froth Housing Momentum (3Y)": safe_divide(base["HPI"], base["HPI"].shift(3)),
+        "Froth Housing Momentum Gap": safe_divide(hpi_yoy, hpi_3y_annualized),
+        "Froth HPI Acceleration (2Y)": hpi_2y_return - hpi_first_year_return,
+        "Froth Yield Curve": base["ltrate"] - base["strate"],
+        "Froth Real Policy Rate": base["cbrate"] - base["infl"],
+        "Froth REER": base["REER"],
+        "Froth REER Z-Score": standardize_full_sample(base["REER"]),
+        "Froth Current Account (3Y Avg)": base["CA_GDP"].rolling(3, min_periods=3).mean(),
+        "Froth Debt Velocity": base["govdebt_GDP"].diff(),
+        "Froth Fiscal Deficit": base["govdef_GDP"],
+        "Froth Fixed Investment / GDP": safe_divide(base["finv"], base["nGDP"]),
+        "Froth Consumption Gap": (base["hcons"].pct_change(fill_method=None) * 100) - (base["rGDP"].pct_change(fill_method=None) * 100),
+        "Froth Combined Consumption Gap": (combined_consumption.pct_change(fill_method=None) * 100) - (base["rGDP"].pct_change(fill_method=None) * 100),
+        "Froth Unemployment Acceleration": base["unemp"].diff().diff(),
+        "Froth Output Gap (HP)": hp_filter_cycle(base["rGDP"]),
+    }
+
+    for name, values in series_map.items():
+        out[name] = pd.DataFrame({"Date": base["Date"], "Value": values})
+
+    out.update(build_nonfinancial_loan_indicators(base, loans_to_nonfin))
+    return out
 
 
 @st.cache_data(show_spinner="Loading data files…")
@@ -307,6 +528,9 @@ def load_all_data():
     vix = pd.read_csv(p("VIX_data.csv")).rename(
         columns={"observation_date": "Date", "VIXCLS": "Value"}
     )
+    sp500_total_return = pd.read_csv(p("sp500_total_return_daily.csv")).rename(
+        columns={"Total_Return": "Value", "Total Return": "Value"}
+    )
 
     # OFR / margin debt
     with open(p("margin_debt_GDP.csv"), "r") as f:
@@ -358,6 +582,15 @@ def load_all_data():
     # Technicals
     technicals = load_spx_technicals("spx_technicals_corrected.csv")
 
+    # GMD macro panel and derived froth indicators
+    gmd_raw = pd.read_csv(p("GMD.csv"))
+    us_gmd = build_us_gmd_frame(gmd_raw)
+    loans_to_nonfin = load_loans_to_nonfin()
+    froth_macro = build_us_froth_indicators(us_gmd, loans_to_nonfin)
+    froth_macro.update(build_global_gmd_indicators(gmd_raw))
+    froth_macro.update(build_ipo_froth_indicators())
+    froth_macro.update(build_fama_volatility_indicators(sp500_total_return))
+
     # Gold / Brent
     gold_brent = pd.merge(gold, brent, on="Date", how="inner").iloc[1:].copy()
     gold_brent["gold_brent_ratio"] = gold_brent["Value_x"] / gold_brent["Value_y"]
@@ -372,6 +605,7 @@ def load_all_data():
         "misery": misery,
         "sahm": sahm,
         "vix": vix,
+        "sp500_total_return": sp500_total_return,
         "ofr_fsi": ofr_fsi,
         "equity_valuation": equity_valuation,
         "skew": skew,
@@ -392,6 +626,9 @@ def load_all_data():
         "gdp_recession": gdp_recession,
         "technicals": technicals,
         "gold_brent": gold_brent,
+        "us_gmd": us_gmd,
+        "loans_to_nonfin": loans_to_nonfin,
+        "froth_macro": froth_macro,
     }
 
 
@@ -471,6 +708,7 @@ def build_notebook_objects(d):
     technicals = d["technicals"]
     sentiment = d["sentiment"]
     gold_brent = d["gold_brent"]
+    froth_macro = d.get("froth_macro", {})
 
     indicator_configs = {
         "Shiller CAPE":              (d["shiller_ratio"],    "Value"),
@@ -512,7 +750,46 @@ def build_notebook_objects(d):
         "MACD":                      (technicals,           "MACD"),
         "BB Upper":                  (technicals,           "BB_Upper"),
         "BB Lower":                  (technicals,           "BB_Lower"),
+        "Froth SPX 36M Volatility":  (froth_macro["Froth SPX 36M Volatility"], "Value"),
+        "Froth SPX Volatility Ratio (3M/24M)": (froth_macro["Froth SPX Volatility Ratio (3M/24M)"], "Value"),
+
+        "Froth Real M2 Growth":      (froth_macro["Froth Real M2 Growth"], "Value"),
+        "Froth Real M3 Growth":      (froth_macro["Froth Real M3 Growth"], "Value"),
+        "Froth Credit-to-GDP Gap":   (froth_macro["Froth Credit-to-GDP Gap"], "Value"),
+        "Froth Global Credit Growth ex-US": (froth_macro["Froth Global Credit Growth ex-US"], "Value"),
+        "Froth Housing Momentum (3Y)": (froth_macro["Froth Housing Momentum (3Y)"], "Value"),
+        "Froth Housing Momentum Gap": (froth_macro["Froth Housing Momentum Gap"], "Value"),
+        "Froth HPI Acceleration (2Y)": (froth_macro["Froth HPI Acceleration (2Y)"], "Value"),
+        "Froth Yield Curve":         (froth_macro["Froth Yield Curve"], "Value"),
+        "Froth Global Yield Curve ex-US": (froth_macro["Froth Global Yield Curve ex-US"], "Value"),
+        "Froth Real Policy Rate":    (froth_macro["Froth Real Policy Rate"], "Value"),
+        "Froth REER Z-Score":        (froth_macro["Froth REER Z-Score"], "Value"),
+        "Froth Current Account (3Y Avg)": (froth_macro["Froth Current Account (3Y Avg)"], "Value"),
+        "Froth Debt Velocity":       (froth_macro["Froth Debt Velocity"], "Value"),
+        "Froth Fiscal Deficit":      (froth_macro["Froth Fiscal Deficit"], "Value"),
+        "Froth Fixed Investment / GDP": (froth_macro["Froth Fixed Investment / GDP"], "Value"),
+        "Froth Consumption Gap":     (froth_macro["Froth Consumption Gap"], "Value"),
+        "Froth Combined Consumption Gap": (froth_macro["Froth Combined Consumption Gap"], "Value"),
+        "Froth Unemployment Acceleration": (froth_macro["Froth Unemployment Acceleration"], "Value"),
+        "Froth Output Gap (HP)":     (froth_macro["Froth Output Gap (HP)"], "Value"),
+
+        "Froth IPO Count": (froth_macro["Froth IPO Count"], "Value"),
+        "Froth IPO Count YoY Growth": (froth_macro["Froth IPO Count YoY Growth"], "Value"),
+        "Froth IPO Median Age": (froth_macro["Froth IPO Median Age"], "Value"),
+        "Froth VC-Backed IPO Share": (froth_macro["Froth VC-Backed IPO Share"], "Value"),
+        "Froth VC-Backed IPO Count Growth": (froth_macro["Froth VC-Backed IPO Count Growth"], "Value"),
+        "Froth Buyout-Backed IPO Share": (froth_macro["Froth Buyout-Backed IPO Share"], "Value"),
+        "Froth Technology IPO Count": (froth_macro["Froth Technology IPO Count"], "Value"),
+        "Froth Technology IPO Share": (froth_macro["Froth Technology IPO Share"], "Value"),
+        "Froth VC-Backed Technology IPO Share": (froth_macro["Froth VC-Backed Technology IPO Share"], "Value"),
     }
+
+    for optional_name in [
+        "Froth Nonfinancial Debt Service",
+        "Froth Nonfinancial Loan Acceleration",
+    ]:
+        if optional_name in froth_macro:
+            indicator_configs[optional_name] = (froth_macro[optional_name], "Value")
 
     indicators = {name: make_indicator(df, col, name) for name, (df, col) in indicator_configs.items()}
     spx_c = prep_spx_from_technicals(technicals)
@@ -781,1126 +1058,7 @@ def render_downturn_heatmap_section(indicators, spx_c, selected, key_prefix="dow
     st.plotly_chart(heat, use_container_width=True)
 
 
-def build_indicator_panel(indicators, spx_c, selected):
-    spx = get_spx_price_series(spx_c)[["Date"]].copy()
-    result_panel = spx.copy()
-    for lbl in selected:
-        ind = get_clean_indicator(indicators, lbl)
-        if ind.empty:
-            continue
-        result_panel = pd.merge_asof(result_panel, ind, on="Date", direction="backward")
 
-    usable = [c for c in result_panel.columns if c != "Date"]
-    if not usable:
-        return pd.DataFrame(columns=["Date"])
-
-    result_panel = result_panel.dropna(subset=usable, how="all").copy()
-    return result_panel.copy()
-
-
-def make_downturn_prediction_dataset(indicators, spx_c, selected, horizon_years=1.0,
-                                     drawdown_threshold=0.20, recovery_threshold=0.05,
-                                     min_spacing_days=126):
-    result_panel = build_indicator_panel(indicators, spx_c, selected)
-    _, events = identify_spx_downturns(
-        spx_c,
-        drawdown_threshold=drawdown_threshold,
-        recovery_threshold=recovery_threshold,
-        min_spacing_days=min_spacing_days
-    )
-
-    if result_panel.empty or events.empty:
-        return result_panel, events
-
-    ds = result_panel.copy()
-    horizon_days = int(round(horizon_years * 365))
-    event_starts = np.sort(pd.to_datetime(events["start_date"]).values.astype("datetime64[ns]"))
-    dates = pd.to_datetime(ds["Date"]).values.astype("datetime64[ns]")
-    future_limits = dates + np.timedelta64(horizon_days, "D")
-    left_idx = np.searchsorted(event_starts, dates, side="left")
-    right_idx = np.searchsorted(event_starts, future_limits, side="right")
-    ds["target_downturn"] = (right_idx > left_idx).astype(int)
-
-    for lbl in selected:
-        if lbl in ds.columns:
-            is_inverted = False
-            if lbl in indicators and "inverted" in indicators[lbl].columns:
-                is_inverted = bool(indicators[lbl]["inverted"].iloc[0])
-            ds[f"{lbl}__pct"] = expanding_percentile_series(ds[lbl], min_periods=20, invert=is_inverted)
-
-    return ds, events
-
-
-def auc_from_scores(y_true, scores):
-    y = pd.Series(y_true).astype(int)
-    s = pd.Series(scores).astype(float)
-    valid = y.notna() & s.notna()
-    y = y[valid]
-    s = s[valid]
-    n_pos = int((y == 1).sum())
-    n_neg = int((y == 0).sum())
-    if n_pos == 0 or n_neg == 0:
-        return np.nan
-    ranks = s.rank(method="average")
-    rank_sum_pos = ranks[y == 1].sum()
-    return float((rank_sum_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
-
-
-def compute_top_bucket_metrics(y_true, scores, top_frac=0.10):
-    y = pd.Series(y_true).astype(int)
-    s = pd.Series(scores).astype(float)
-    valid = y.notna() & s.notna()
-    y = y[valid]
-    s = s[valid]
-    if len(y) < 20:
-        return {"precision": np.nan, "recall": np.nan, "f1": np.nan, "lift": np.nan, "flag_rate": np.nan}
-
-    cutoff = s.quantile(1 - top_frac)
-    pred = (s >= cutoff).astype(int)
-    tp = int(((pred == 1) & (y == 1)).sum())
-    fp = int(((pred == 1) & (y == 0)).sum())
-    fn = int(((pred == 0) & (y == 1)).sum())
-    precision = tp / (tp + fp) if (tp + fp) > 0 else np.nan
-    recall = tp / (tp + fn) if (tp + fn) > 0 else np.nan
-    f1 = (2 * precision * recall / (precision + recall)
-          if pd.notna(precision) and pd.notna(recall) and (precision + recall) > 0 else np.nan)
-    base_rate = y.mean()
-    lift = precision / base_rate if pd.notna(precision) and pd.notna(base_rate) and base_rate > 0 else np.nan
-    return {"precision": precision, "recall": recall, "f1": f1, "lift": lift, "flag_rate": pred.mean()}
-
-
-def evaluate_indicator_combos(indicators, spx_c, selected, horizon_years=1.0,
-                              drawdown_threshold=0.20, recovery_threshold=0.05,
-                              min_spacing_days=126, max_combo_size=4):
-    if not selected:
-        return pd.DataFrame(), pd.DataFrame()
-
-    ds, _ = make_downturn_prediction_dataset(
-        indicators=indicators,
-        spx_c=spx_c,
-        selected=selected,
-        horizon_years=horizon_years,
-        drawdown_threshold=drawdown_threshold,
-        recovery_threshold=recovery_threshold,
-        min_spacing_days=min_spacing_days
-    )
-
-    if ds.empty or "target_downturn" not in ds.columns:
-        return pd.DataFrame(), ds
-
-    X_cols = [f"{lbl}__pct" for lbl in selected if f"{lbl}__pct" in ds.columns]
-    if not X_cols:
-        return pd.DataFrame(), ds
-
-    X = ds[X_cols].to_numpy(dtype=float)
-    y = ds["target_downturn"].to_numpy(dtype=int)
-
-    label_to_xcol = {}
-    xcol = 0
-    for lbl in selected:
-        if f"{lbl}__pct" in ds.columns:
-            label_to_xcol[lbl] = xcol
-            xcol += 1
-
-    results = []
-    for k in range(1, min(max_combo_size, len(selected)) + 1):
-        for combo in combinations(selected, k):
-            idxs = [label_to_xcol[lbl] for lbl in combo if lbl in label_to_xcol]
-            if len(idxs) != len(combo):
-                continue
-
-            subX = X[:, idxs]
-            valid_mask = ~np.isnan(subX).any(axis=1)
-            if valid_mask.sum() < 50:
-                continue
-
-            signal = subX[valid_mask].mean(axis=1)
-            yv = y[valid_mask]
-            auc = auc_from_scores(yv, signal)
-
-            top_decile_cut = np.nanquantile(signal, 0.90)
-            top_decile_mask = signal >= top_decile_cut
-            hit_rate_top_decile = yv[top_decile_mask].mean() if top_decile_mask.sum() else np.nan
-
-            pos_mask = yv == 1
-            neg_mask = yv == 0
-            pos_mean = signal[pos_mask].mean() if pos_mask.any() else np.nan
-            neg_mean = signal[neg_mask].mean() if neg_mask.any() else np.nan
-            separation = pos_mean - neg_mean if pd.notna(pos_mean) and pd.notna(neg_mean) else np.nan
-
-            m10 = compute_top_bucket_metrics(yv, signal, top_frac=0.10)
-            m05 = compute_top_bucket_metrics(yv, signal, top_frac=0.05)
-
-            results.append({
-                "combo": " + ".join(combo),
-                "size": k,
-                "auc": auc,
-                "hit_rate_top_decile": hit_rate_top_decile,
-                "pos_mean_signal": pos_mean,
-                "neg_mean_signal": neg_mean,
-                "signal_separation": separation,
-                "precision_top10": m10["precision"],
-                "recall_top10": m10["recall"],
-                "f1_top10": m10["f1"],
-                "lift_top10": m10["lift"],
-                "precision_top5": m05["precision"],
-                "recall_top5": m05["recall"],
-                "f1_top5": m05["f1"],
-                "lift_top5": m05["lift"],
-                "n_obs": int(valid_mask.sum()),
-                "n_positive": int(yv.sum())
-            })
-
-    res = pd.DataFrame(results)
-    if not res.empty:
-        res = res.sort_values(
-            ["f1_top10", "precision_top10", "auc", "signal_separation", "n_obs"],
-            ascending=[False, False, False, False, False]
-        ).reset_index(drop=True)
-
-    return res, ds
-
-
-@st.cache_data(show_spinner=False)
-def build_selected_master_dataset(
-    indicators,
-    spx_c,
-    selected,
-    drawdown_threshold=0.20,
-    recovery_threshold=0.05,
-    min_spacing_days=126,
-    lead_days=252
-):
-    spx = get_spx_price_series(spx_c).rename(columns={"close": "close"}).copy()
-    spx = spx.sort_values("Date").reset_index(drop=True)
-    spx["target_downturn"] = 0.0
-
-    _, events = identify_spx_downturns(
-        spx_c,
-        drawdown_threshold=drawdown_threshold,
-        recovery_threshold=recovery_threshold,
-        min_spacing_days=min_spacing_days
-    )
-    event_dates = set(pd.to_datetime(events["start_date"])) if not events.empty else set()
-    for ev_date in sorted(event_dates):
-        ev_idx_list = spx.index[spx["Date"] == ev_date].tolist()
-        if not ev_idx_list:
-            continue
-        ev_idx = ev_idx_list[0]
-        start_idx = max(0, ev_idx - int(lead_days))
-        spx.loc[start_idx:ev_idx - 1, "target_downturn"] = 1.0
-        spx.loc[ev_idx, "target_downturn"] = np.nan
-
-    master = spx[["Date", "close", "target_downturn"]].copy()
-    for name in selected:
-        ind = get_clean_indicator(indicators, name)
-        tol_days = 7 if len(ind) > 10 and ind["Date"].diff().dt.days.median() <= 5 else 90
-        master = pd.merge_asof(
-            master.sort_values("Date"),
-            ind.sort_values("Date"),
-            on="Date",
-            tolerance=pd.Timedelta(days=tol_days),
-            direction="backward"
-        )
-        if name in master.columns:
-            master[name] = master[name].ffill()
-
-    master = master.loc[master["Date"] >= pd.Timestamp(WF_SAMPLE_START_DATE)].reset_index(drop=True)
-    return master
-
-
-@st.cache_data(show_spinner=False)
-def build_percentile_feature_master(master_ds, selected):
-    master = pd.DataFrame(master_ds).copy()
-    selected = list(selected)
-    for name in selected:
-        if name in master.columns:
-            master[f"{name}__pct"] = expanding_percentile_series(master[name], min_periods=WF_WARMUP_DAYS)
-    return master
-
-
-def fit_alert_threshold(raw_signal, alert_threshold=WF_ALERT_THRESHOLD, smooth_days=WF_SMOOTH_DAYS):
-    s = pd.Series(raw_signal, dtype=float)
-    smoothed = s.rolling(smooth_days, min_periods=smooth_days).mean().dropna()
-    if len(smoothed) == 0:
-        return np.nan
-    return np.nanpercentile(smoothed, 100 * (1 - alert_threshold))
-
-
-def extract_discrete_events(is_on, reset_days=WF_RESET_DAYS):
-    is_on = pd.Series(is_on).fillna(False).astype(bool)
-    events = np.zeros(len(is_on), dtype=int)
-    last_event_idx = -(10 ** 9)
-    prev_on = False
-
-    for i in range(len(is_on)):
-        if is_on.iloc[i]:
-            if (not prev_on) or ((i - last_event_idx) >= reset_days):
-                events[i] = 1
-                last_event_idx = i
-            prev_on = True
-        else:
-            prev_on = False
-
-    return events
-
-
-def build_trigger_engine(raw_signal, threshold, smooth_days=WF_SMOOTH_DAYS, reset_days=WF_RESET_DAYS):
-    s = pd.Series(raw_signal, dtype=float)
-    smoothed = s.rolling(smooth_days, min_periods=smooth_days).mean()
-    is_on = smoothed >= threshold
-    events = extract_discrete_events(is_on, reset_days=reset_days)
-    return pd.DataFrame({
-        "raw_signal": s,
-        "smoothed_signal": smoothed,
-        "is_on": is_on,
-        "event": events
-    })
-
-
-def compute_distinct_crisis_metrics(trigger_dates, event_dates, horizon_days=252):
-    trigger_dates = pd.to_datetime(pd.Series(trigger_dates)).dropna().sort_values().reset_index(drop=True)
-    event_dates = pd.to_datetime(pd.Series(event_dates)).dropna().sort_values().reset_index(drop=True)
-    used_trigger_idx = set()
-    tp = 0
-    lead_sum = 0.0
-
-    for ev in event_dates:
-        window_start = ev - pd.Timedelta(days=int(horizon_days * 365.25 / 252))
-        eligible = [
-            (idx, dt) for idx, dt in enumerate(trigger_dates)
-            if idx not in used_trigger_idx and window_start <= dt < ev
-        ]
-        if not eligible:
-            continue
-        idx, first = eligible[0]
-        used_trigger_idx.add(idx)
-        tp += 1
-        lead_sum += (ev - first).days
-
-    precision = tp / len(trigger_dates) if len(trigger_dates) else 0.0
-    recall = tp / len(event_dates) if len(event_dates) else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
-    avg_lead = lead_sum / tp if tp else 0.0
-    return {
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "avg_lead": avg_lead,
-        "n_triggers": len(trigger_dates),
-        "n_crises": len(event_dates),
-        "n_caught": tp
-    }
-
-
-@st.cache_data(show_spinner=False)
-def run_walk_forward_search_cached(master_ds, selected, horizon_years, max_combo_size):
-    master_ds = pd.DataFrame(master_ds).copy()
-    master_ds = master_ds.dropna(subset=["target_downturn"]).reset_index(drop=True)
-    if len(master_ds) <= WF_WARMUP_DAYS + WF_MIN_TEST_ROWS:
-        return pd.DataFrame(), pd.DataFrame()
-
-    fold_size = max(1, (len(master_ds) - WF_WARMUP_DAYS) // WF_N_FOLDS)
-    fold_rows = []
-    purge_days = int(round(float(horizon_years) * 252))
-
-    for i in range(WF_N_FOLDS):
-        test_start = WF_WARMUP_DAYS + i * fold_size
-        test_end = WF_WARMUP_DAYS + (i + 1) * fold_size if i < WF_N_FOLDS - 1 else len(master_ds)
-        train_end = max(WF_WARMUP_DAYS, test_start - purge_days)
-
-        prefix = master_ds.iloc[:test_end].copy()
-        for name in selected:
-            if name in prefix.columns:
-                prefix[f"{name}__pct"] = expanding_percentile_series(prefix[name], min_periods=WF_WARMUP_DAYS)
-
-        train_df = prefix.iloc[WF_WARMUP_DAYS:train_end].copy()
-        test_df = prefix.iloc[test_start:test_end].copy()
-        if len(train_df) < WF_MIN_TRAIN_ROWS or len(test_df) < WF_MIN_TEST_ROWS:
-            continue
-
-        event_starts_test = test_df.loc[
-            (test_df["target_downturn"].fillna(0).astype(int) == 1) &
-            (test_df["target_downturn"].shift(1).fillna(0).astype(int) == 0),
-            "Date"
-        ]
-        if len(event_starts_test) < 1:
-            continue
-
-        for k in range(1, min(max_combo_size, len(selected)) + 1):
-            for combo in combinations(selected, k):
-                cols = [f"{c}__pct" for c in combo if f"{c}__pct" in train_df.columns]
-                if len(cols) != len(combo):
-                    continue
-                sub_train = train_df[["Date"] + cols].dropna().copy()
-                sub_test = test_df[["Date"] + cols].dropna().copy()
-                if len(sub_train) < WF_WARMUP_DAYS or len(sub_test) < WF_MIN_TEST_ROWS:
-                    continue
-
-                sig_train = sub_train[cols].mean(axis=1)
-                sig_test = sub_test[cols].mean(axis=1)
-                threshold = fit_alert_threshold(sig_train)
-                if pd.isna(threshold):
-                    continue
-                trig_test = build_trigger_engine(sig_test, threshold)
-                trigger_dates = sub_test.loc[trig_test["event"] == 1, "Date"]
-                m = compute_distinct_crisis_metrics(trigger_dates, event_starts_test, horizon_days=int(round(horizon_years * 252)))
-                score = m["recall"] * min(2.0, 1 + (m["avg_lead"] / 252)) * m["precision"]
-                fold_rows.append({
-                    "combo": " + ".join(combo),
-                    "fold": i + 1,
-                    "size": k,
-                    "f1": m["f1"],
-                    "recall": m["recall"],
-                    "prec": m["precision"],
-                    "avg_lead": m["avg_lead"],
-                    "score": score
-                })
-
-    if not fold_rows:
-        return pd.DataFrame(), pd.DataFrame()
-
-    fold_results = pd.DataFrame(fold_rows)
-    agg = (
-        fold_results.groupby("combo")
-        .agg(
-            mean_f1=("f1", "mean"),
-            mean_rec=("recall", "mean"),
-            mean_prec=("prec", "mean"),
-            mean_lead=("avg_lead", "mean"),
-            mean_score=("score", "mean"),
-            n_folds=("fold", "nunique"),
-            size=("size", "first")
-        )
-        .reset_index()
-        .query("n_folds >= 2")
-        .sort_values(["n_folds", "mean_score", "mean_f1"], ascending=[False, False, False])
-        .reset_index(drop=True)
-    )
-    return agg, fold_results
-
-
-@st.cache_data(show_spinner=False)
-def prepare_ml_fold_inputs_cached(master_ds, selected, horizon_years):
-    later_df = pd.DataFrame(master_ds).copy()
-    selected = list(selected)
-    feature_cols = [f"{name}__pct" for name in selected if f"{name}__pct" in later_df.columns]
-    empty_result = {
-        "keep_features": [],
-        "valid_folds": [],
-        "eval_start": pd.NaT,
-        "eval_end": pd.NaT,
-        "n_realized_events": 0
-    }
-
-    if not feature_cols:
-        return empty_result
-
-    later_df = later_df.loc[later_df["Date"] >= pd.Timestamp(WF_SAMPLE_START_DATE)].dropna(subset=["target_downturn"]).reset_index(drop=True)
-    coverage = later_df[feature_cols].notna().mean().sort_values(ascending=False)
-    keep_features = coverage[coverage >= (1 - ML_MAX_MISSING_FEATURE_FRAC)].index.tolist()
-    if not keep_features:
-        return empty_result
-
-    later_df[keep_features] = later_df[keep_features].ffill()
-    first_test_start = WF_WARMUP_DAYS + WF_MIN_TRAIN_ROWS + int(round(float(horizon_years) * 252))
-    remaining = len(later_df) - first_test_start
-    if remaining <= 0:
-        return empty_result
-
-    fold_size = remaining // WF_N_FOLDS
-    if fold_size < WF_MIN_TEST_ROWS:
-        return empty_result
-
-    valid_folds = []
-    purge_days = int(round(float(horizon_years) * 252))
-    for i in range(WF_N_FOLDS):
-        test_start = first_test_start + i * fold_size
-        test_end = first_test_start + (i + 1) * fold_size if i < WF_N_FOLDS - 1 else len(later_df)
-        train_end = test_start - purge_days
-        train_df = later_df.iloc[WF_WARMUP_DAYS:train_end].copy().reset_index(drop=True)
-        test_df = later_df.iloc[test_start:test_end].copy().reset_index(drop=True)
-        if len(train_df) < WF_MIN_TRAIN_ROWS or len(test_df) < WF_MIN_TEST_ROWS:
-            continue
-        medians = train_df[keep_features].median()
-        train_df[keep_features] = train_df[keep_features].fillna(medians)
-        test_df[keep_features] = test_df[keep_features].fillna(medians)
-        y_train = train_df["target_downturn"].astype(int)
-        if y_train.nunique() < 2:
-            continue
-        valid_folds.append((i + 1, train_df.to_dict("list"), test_df.to_dict("list")))
-
-    if len(valid_folds) < 2:
-        return empty_result
-
-    eval_start = min(pd.to_datetime(test_df["Date"]).min() for _, _, test_df in [(fid, pd.DataFrame(tr), pd.DataFrame(te)) for fid, tr, te in valid_folds])
-    eval_end = max(pd.to_datetime(test_df["Date"]).max() for _, _, test_df in [(fid, pd.DataFrame(tr), pd.DataFrame(te)) for fid, tr, te in valid_folds])
-    realized_events_eval = (
-        pd.concat([get_event_starts_from_target(pd.DataFrame(test_df)) for _, _, test_df in valid_folds], ignore_index=True)
-        .dropna()
-        .drop_duplicates()
-        .sort_values()
-        .reset_index(drop=True)
-    )
-
-    return {
-        "keep_features": keep_features,
-        "valid_folds": valid_folds,
-        "eval_start": eval_start,
-        "eval_end": eval_end,
-        "n_realized_events": int(len(realized_events_eval))
-    }
-
-
-def choose_ml_model(model_type="random_forest"):
-    if model_type == "decision_tree":
-        return DecisionTreeClassifier(
-            max_depth=ML_TREE_MAX_DEPTH,
-            min_samples_leaf=ML_TREE_MIN_SAMPLES_LEAF,
-            random_state=ML_RANDOM_STATE,
-            class_weight="balanced"
-        )
-
-    return RandomForestClassifier(
-        n_estimators=ML_RF_N_ESTIMATORS,
-        max_depth=ML_RF_MAX_DEPTH,
-        min_samples_leaf=ML_RF_MIN_SAMPLES_LEAF,
-        random_state=ML_RANDOM_STATE,
-        class_weight="balanced",
-        n_jobs=-1
-    )
-
-
-def get_oof_train_probs(X_train, y_train, n_splits=ML_INNER_OOF_SPLITS, model_type="random_forest"):
-    X_train = X_train.reset_index(drop=True)
-    y_train = pd.Series(y_train).reset_index(drop=True)
-    oof_prob = pd.Series(np.nan, index=X_train.index, dtype=float)
-    if len(X_train) < (n_splits + 1) * 20 or y_train.nunique() < 2:
-        return oof_prob.values
-    tscv = TimeSeriesSplit(n_splits=n_splits)
-    for inner_train_idx, inner_val_idx in tscv.split(X_train):
-        X_tr = X_train.iloc[inner_train_idx]
-        y_tr = y_train.iloc[inner_train_idx]
-        X_val = X_train.iloc[inner_val_idx]
-        if y_tr.nunique() < 2:
-            continue
-        model = choose_ml_model(model_type=model_type)
-        model.fit(X_tr, y_tr)
-        oof_prob.iloc[inner_val_idx] = model.predict_proba(X_val)[:, 1]
-    return oof_prob.values
-
-
-@st.cache_data(show_spinner=False)
-def run_ml_search_cached(master_ds, selected, horizon_years, max_combo_size, model_type="random_forest"):
-    prep = prepare_ml_fold_inputs_cached(master_ds, selected, horizon_years)
-    keep_features = prep["keep_features"]
-    valid_folds = [
-        (fold_id, pd.DataFrame(train_dict), pd.DataFrame(test_dict))
-        for fold_id, train_dict, test_dict in prep["valid_folds"]
-    ]
-    if not keep_features:
-        return {
-            "single_summary": pd.DataFrame(),
-            "combo_summary": pd.DataFrame(),
-            "combo_fold_results": pd.DataFrame(),
-            "individual_combo_table": pd.DataFrame(),
-            "augmented_combo_table": pd.DataFrame(),
-            "eval_start": pd.NaT,
-            "eval_end": pd.NaT,
-            "n_realized_events": 0,
-            "tree_details": None
-        }
-    if len(valid_folds) < 2:
-        return {
-            "single_summary": pd.DataFrame(),
-            "combo_summary": pd.DataFrame(),
-            "combo_fold_results": pd.DataFrame(),
-            "individual_combo_table": pd.DataFrame(),
-            "augmented_combo_table": pd.DataFrame(),
-            "eval_start": pd.NaT,
-            "eval_end": pd.NaT,
-            "n_realized_events": 0,
-            "tree_details": None
-        }
-
-    single_rows = []
-    for feat in keep_features:
-        for fold_id, train_df, test_df in valid_folds:
-            X_train = train_df[[feat]].astype(float)
-            X_test = test_df[[feat]].astype(float)
-            y_train = train_df["target_downturn"].astype(int)
-            if y_train.nunique() < 2:
-                continue
-            oof_train_prob = get_oof_train_probs(X_train, y_train, model_type=model_type)
-            threshold = fit_alert_threshold(oof_train_prob)
-            if pd.isna(threshold):
-                continue
-            model = choose_ml_model(model_type=model_type)
-            model.fit(X_train, y_train)
-            test_prob = model.predict_proba(X_test)[:, 1]
-            metrics, _ = compute_ml_fold_alarm_metrics(test_df, test_prob, threshold, horizon_years)
-            single_rows.append({
-                "indicator": feat.replace("__pct", ""),
-                "fold": fold_id,
-                "test_precision": metrics["precision"],
-                "test_recall": metrics["recall"],
-                "test_f1": metrics["f1"],
-                "test_avg_lead": metrics["avg_lead"],
-                "n_caught": metrics["n_caught"]
-            })
-    single_results = pd.DataFrame(single_rows)
-    if single_results.empty:
-        return {
-            "single_summary": pd.DataFrame(),
-            "combo_summary": pd.DataFrame(),
-            "combo_fold_results": pd.DataFrame(),
-            "individual_combo_table": pd.DataFrame(),
-            "augmented_combo_table": pd.DataFrame(),
-            "eval_start": pd.NaT,
-            "eval_end": pd.NaT,
-            "n_realized_events": 0,
-            "tree_details": None
-        }
-
-    single_summary = (
-        single_results.groupby("indicator", as_index=False)
-        .agg(
-            mean_test_precision=("test_precision", "mean"),
-            mean_test_recall=("test_recall", "mean"),
-            mean_test_f1=("test_f1", "mean"),
-            mean_test_avg_lead=("test_avg_lead", "mean"),
-            mean_n_caught=("n_caught", "mean"),
-            n_folds=("fold", "nunique")
-        )
-        .sort_values(["mean_test_f1", "mean_test_recall", "mean_test_precision"], ascending=False)
-        .reset_index(drop=True)
-    )
-
-    finalist_features = [f"{name}__pct" for name in single_summary.head(min(ML_N_FINALISTS, len(single_summary)))["indicator"].tolist()]
-    combo_rows = []
-    for k in range(1, min(max_combo_size, len(finalist_features)) + 1):
-        for combo in combinations(finalist_features, k):
-            for fold_id, train_df, test_df in valid_folds:
-                X_train = train_df[list(combo)].astype(float)
-                X_test = test_df[list(combo)].astype(float)
-                y_train = train_df["target_downturn"].astype(int)
-                if y_train.nunique() < 2:
-                    continue
-                oof_train_prob = get_oof_train_probs(X_train, y_train, model_type=model_type)
-                threshold = fit_alert_threshold(oof_train_prob)
-                if pd.isna(threshold):
-                    continue
-                model = choose_ml_model(model_type=model_type)
-                model.fit(X_train, y_train)
-                test_prob = model.predict_proba(X_test)[:, 1]
-                metrics, _ = compute_ml_fold_alarm_metrics(test_df, test_prob, threshold, horizon_years)
-                combo_rows.append({
-                    "combo": " + ".join([c.replace("__pct", "") for c in combo]),
-                    "size": len(combo),
-                    "fold": fold_id,
-                    "test_precision": metrics["precision"],
-                    "test_recall": metrics["recall"],
-                    "test_f1": metrics["f1"],
-                    "test_avg_lead": metrics["avg_lead"],
-                    "n_caught": metrics["n_caught"]
-                })
-    combo_fold_results = pd.DataFrame(combo_rows)
-    if combo_fold_results.empty:
-        return {
-            "single_summary": single_summary,
-            "combo_summary": pd.DataFrame(),
-            "combo_fold_results": pd.DataFrame(),
-            "individual_combo_table": pd.DataFrame(),
-            "augmented_combo_table": pd.DataFrame(),
-            "eval_start": pd.NaT,
-            "eval_end": pd.NaT,
-            "n_realized_events": 0,
-            "tree_details": None
-        }
-
-    combo_summary = (
-        combo_fold_results.groupby("combo", as_index=False)
-        .agg(
-            size=("size", "first"),
-            mean_test_precision=("test_precision", "mean"),
-            mean_test_recall=("test_recall", "mean"),
-            mean_test_f1=("test_f1", "mean"),
-            mean_test_avg_lead=("test_avg_lead", "mean"),
-            mean_n_caught=("n_caught", "mean"),
-            n_folds=("fold", "nunique")
-        )
-        .query("n_folds >= @ML_MIN_FOLDS_REQUIRED")
-        .sort_values(["mean_test_f1", "mean_test_recall", "mean_test_precision"], ascending=False)
-        .reset_index(drop=True)
-    )
-    realized_events_eval = (
-        pd.concat([get_event_starts_from_target(test_df) for _, _, test_df in valid_folds], ignore_index=True)
-        .dropna()
-        .drop_duplicates()
-        .sort_values()
-        .reset_index(drop=True)
-    )
-    eval_start = min(test_df["Date"].min() for _, _, test_df in valid_folds)
-    eval_end = max(test_df["Date"].max() for _, _, test_df in valid_folds)
-    individual_combo_table = build_individual_combo_table(
-        combo_summary_df=combo_summary,
-        evaluation_folds=valid_folds,
-        realized_events_eval=realized_events_eval,
-        horizon_years=horizon_years,
-        top_n=ML_TOP_COMBOS,
-        model_type=model_type
-    )
-    augmented_combo_table = build_augmented_combo_table(
-        combo_summary_df=combo_summary,
-        evaluation_folds=valid_folds,
-        realized_events_eval=realized_events_eval,
-        keep_features=keep_features,
-        horizon_years=horizon_years,
-        top_n=ML_TOP_COMBOS,
-        model_type=model_type
-    )
-    tree_details = None
-    if model_type == "decision_tree" and not combo_summary.empty:
-        tree_details = build_decision_tree_details(
-            combo_name=combo_summary.iloc[0]["combo"],
-            fold_data=valid_folds,
-            horizon_years=horizon_years
-        )
-    return {
-        "single_summary": single_summary,
-        "combo_summary": combo_summary,
-        "combo_fold_results": combo_fold_results,
-        "individual_combo_table": individual_combo_table,
-        "augmented_combo_table": augmented_combo_table,
-        "eval_start": prep["eval_start"],
-        "eval_end": prep["eval_end"],
-        "n_realized_events": prep["n_realized_events"],
-        "tree_details": tree_details
-    }
-
-
-def compute_ml_fold_alarm_metrics(test_df, test_prob, threshold, horizon_years):
-    test_engine = build_trigger_engine(test_prob, threshold)
-    trigger_dates = test_df.loc[test_engine["event"].values == 1, "Date"].reset_index(drop=True)
-    event_starts = get_event_starts_from_target(test_df)
-    metrics = compute_distinct_crisis_metrics(trigger_dates, event_starts, horizon_days=int(round(horizon_years * 252)))
-    return metrics, trigger_dates
-
-
-def get_event_starts_from_target(df):
-    y = pd.Series(df["target_downturn"]).fillna(0).astype(int).reset_index(drop=True)
-    dates = pd.to_datetime(df["Date"]).reset_index(drop=True)
-    starts = []
-    prev = 0
-    for i in range(len(y)):
-        if y.iloc[i] == 1 and prev == 0:
-            starts.append(dates.iloc[i])
-        prev = y.iloc[i]
-    return pd.Series(starts, dtype="datetime64[ns]")
-
-
-def combo_name_to_feature_list(combo_name):
-    return [f"{x.strip()}__pct" for x in combo_name.split(" + ")]
-
-
-def get_trigger_dates_for_combo(combo_name, fold_data, model_type="random_forest"):
-    feats = combo_name_to_feature_list(combo_name)
-    all_trigger_dates = []
-
-    for _, train_df, test_df in fold_data:
-        if any(f not in train_df.columns for f in feats):
-            continue
-
-        X_train = train_df[feats].astype(float)
-        X_test = test_df[feats].astype(float)
-        y_train = train_df["target_downturn"].astype(int)
-
-        if y_train.nunique() < 2:
-            continue
-
-        oof_train_prob = get_oof_train_probs(X_train, y_train, model_type=model_type)
-        threshold = fit_alert_threshold(oof_train_prob)
-        if pd.isna(threshold):
-            continue
-
-        model = choose_ml_model(model_type=model_type)
-        model.fit(X_train, y_train)
-        test_prob = model.predict_proba(X_test)[:, 1]
-        test_engine = build_trigger_engine(test_prob, threshold)
-        fold_trigger_dates = test_df.loc[test_engine["event"].values == 1, "Date"].reset_index(drop=True)
-        all_trigger_dates.append(pd.to_datetime(fold_trigger_dates))
-
-    if not all_trigger_dates:
-        return pd.Series([], dtype="datetime64[ns]")
-
-    return (
-        pd.concat(all_trigger_dates, ignore_index=True)
-        .dropna()
-        .drop_duplicates()
-        .sort_values()
-        .reset_index(drop=True)
-    )
-
-
-def build_individual_combo_table(combo_summary_df, evaluation_folds, realized_events_eval, horizon_years, top_n=ML_TOP_COMBOS, model_type="random_forest"):
-    if combo_summary_df.empty:
-        return pd.DataFrame()
-
-    rows = []
-    for combo_name in combo_summary_df.head(top_n)["combo"].tolist():
-        trigger_dates = get_trigger_dates_for_combo(combo_name, evaluation_folds, model_type=model_type)
-        m = compute_distinct_crisis_metrics(
-            trigger_dates=trigger_dates,
-            event_dates=realized_events_eval,
-            horizon_days=int(round(horizon_years * 252))
-        )
-        rows.append({
-            "combo": combo_name,
-            "precision": m["precision"],
-            "recall": m["recall"],
-            "f1": m["f1"],
-            "avg_lead": m["avg_lead"],
-            "n_triggers": m["n_triggers"],
-            "n_crises": m["n_crises"],
-            "n_caught": m["n_caught"]
-        })
-
-    if not rows:
-        return pd.DataFrame()
-
-    return (
-        pd.DataFrame(rows)
-        .sort_values(["recall", "f1", "precision", "avg_lead"], ascending=False)
-        .reset_index(drop=True)
-    )
-
-
-def build_augmented_combo_table(combo_summary_df, evaluation_folds, realized_events_eval, keep_features, horizon_years, top_n=ML_TOP_COMBOS, model_type="random_forest"):
-    if combo_summary_df.empty:
-        return pd.DataFrame()
-
-    top_combos = combo_summary_df.head(top_n)["combo"].tolist()
-    keep_feature_names = {c.replace("__pct", "") for c in keep_features}
-    available_augmenters = [x for x in REGIME_AUGMENT_CANDIDATES if x in keep_feature_names]
-    rows = []
-
-    for base_combo in top_combos:
-        base_triggers = get_trigger_dates_for_combo(base_combo, evaluation_folds, model_type=model_type)
-        base_parts = {x.strip() for x in base_combo.split(" + ")}
-
-        for aug_indicator in available_augmenters:
-            if aug_indicator in base_parts:
-                continue
-
-            aug_triggers = get_trigger_dates_for_combo(aug_indicator, evaluation_folds, model_type=model_type)
-            union_triggers = (
-                pd.concat([pd.Series(base_triggers), pd.Series(aug_triggers)], ignore_index=True)
-                .dropna()
-                .drop_duplicates()
-                .sort_values()
-                .reset_index(drop=True)
-            )
-            m = compute_distinct_crisis_metrics(
-                trigger_dates=union_triggers,
-                event_dates=realized_events_eval,
-                horizon_days=int(round(horizon_years * 252))
-            )
-            rows.append({
-                "base_combo": base_combo,
-                "augmenter": aug_indicator,
-                "augmented_combo": f"{base_combo} || {aug_indicator}",
-                "precision": m["precision"],
-                "recall": m["recall"],
-                "f1": m["f1"],
-                "avg_lead": m["avg_lead"],
-                "n_triggers": m["n_triggers"],
-                "n_crises": m["n_crises"],
-                "n_caught": m["n_caught"]
-            })
-
-    if not rows:
-        return pd.DataFrame()
-
-    return (
-        pd.DataFrame(rows)
-        .sort_values(["recall", "f1", "precision", "avg_lead"], ascending=False)
-        .reset_index(drop=True)
-    )
-
-
-def build_decision_tree_details(combo_name, fold_data, horizon_years):
-    feats = combo_name_to_feature_list(combo_name)
-    if not fold_data:
-        return None
-
-    fold_id, train_df, test_df = fold_data[-1]
-    if any(f not in train_df.columns for f in feats):
-        return None
-
-    X_train = train_df[feats].astype(float)
-    X_test = test_df[feats].astype(float)
-    y_train = train_df["target_downturn"].astype(int)
-    if y_train.nunique() < 2:
-        return None
-
-    oof_train_prob = get_oof_train_probs(X_train, y_train, model_type="decision_tree")
-    threshold = fit_alert_threshold(oof_train_prob)
-    if pd.isna(threshold):
-        return None
-
-    model = choose_ml_model(model_type="decision_tree")
-    model.fit(X_train, y_train)
-    test_prob = model.predict_proba(X_test)[:, 1]
-    feature_names = [f.replace("__pct", "") for f in feats]
-    rules_text = export_text(model, feature_names=feature_names)
-    importance_df = pd.DataFrame({
-        "feature": feature_names,
-        "importance": model.feature_importances_
-    }).sort_values("importance", ascending=False).reset_index(drop=True)
-    test_view = pd.DataFrame({
-        "Date": pd.to_datetime(test_df["Date"]),
-        "probability": test_prob,
-        "target_downturn": pd.Series(test_df["target_downturn"]).fillna(0).astype(int)
-    })
-    test_view["event_start"] = (
-        (test_view["target_downturn"] == 1) &
-        (test_view["target_downturn"].shift(1).fillna(0) == 0)
-    )
-
-    return {
-        "combo": combo_name,
-        "fold": int(fold_id),
-        "threshold": float(threshold),
-        "rules_text": rules_text,
-        "importance": importance_df.to_dict("records"),
-        "test_view": test_view.to_dict("list"),
-        "horizon_years": float(horizon_years)
-    }
-
-
-@st.cache_data(show_spinner=False)
-def build_decision_tree_details_cached(master_ds, selected, horizon_years, combo_name):
-    prep = prepare_ml_fold_inputs_cached(master_ds, selected, horizon_years)
-    valid_folds = [
-        (fold_id, pd.DataFrame(train_dict), pd.DataFrame(test_dict))
-        for fold_id, train_dict, test_dict in prep["valid_folds"]
-    ]
-    if not valid_folds:
-        return None
-    return build_decision_tree_details(combo_name, valid_folds, horizon_years)
-
-
-def apply_layout(fig, title="", height=450):
-    fig.update_layout(
-        template="plotly_white",
-        title=dict(text=title, x=0, font=dict(size=15, color=TEXT)),
-        height=height,
-        margin=dict(l=52, r=20, t=56, b=42),
-        paper_bgcolor=BG,
-        plot_bgcolor=BG2,
-        hovermode="closest",
-        legend=dict(
-            orientation="h", yanchor="bottom", y=1.02,
-            xanchor="right", x=1, bgcolor="rgba(255,255,255,0.8)"
-        )
-    )
-    fig.update_xaxes(showgrid=True, gridcolor=BORDER, zeroline=False, linecolor=BORDER)
-    fig.update_yaxes(showgrid=True, gridcolor=BORDER, zeroline=False, linecolor=BORDER)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 6. APP STATE
-# ══════════════════════════════════════════════════════════════════════════════
-def init_state(all_indicator_names):
-    if "shared_selected" not in st.session_state:
-        st.session_state.shared_selected = [x for x in ["Shiller CAPE", "Tobin Q"] if x in all_indicator_names]
-    if "shared_search_input" not in st.session_state:
-        st.session_state.shared_search_input = ""
-
-
-def get_combo_selected():
-    return list(st.session_state.shared_selected)
-
-
-def set_combo_selection(names, all_indicator_names):
-    st.session_state.shared_selected = [x for x in names if x in all_indicator_names]
-
-
-def render_selection_pills(selected):
-    if not selected:
-        st.markdown(f"<div class='small-muted'>No indicators selected.</div>", unsafe_allow_html=True)
-        return
-    pills = "".join([f"<span class='metric-pill'>{x}</span>" for x in selected])
-    st.markdown(
-        f"<div class='small-muted' style='font-weight:700;margin-bottom:4px;'>Selected ({len(selected)})</div>{pills}",
-        unsafe_allow_html=True
-    )
-
-
-def render_shared_indicator_picker(all_indicator_names):
-    current = get_combo_selected()
-    current = get_combo_selected()
-    pills = "".join([f"<span class='metric-pill'>{x}</span>" for x in current]) if current else ""
-    summary_html = f"""
-        <div style="
-            padding:12px 14px;
-            border-radius:16px;
-            border:1px solid {BORDER};
-            background:linear-gradient(135deg,#f8fbff 0%,#ffffff 100%);
-            margin:4px 0 10px;">
-            <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;">
-                <div>
-                    <div style="font-size:12px;font-weight:800;color:{TEXT};">Selected indicators</div>
-                    <div style="font-size:11px;color:{MUTED};margin-top:3px;">{len(current)} selected</div>
-                </div>
-                <div style="font-size:11px;color:{MUTED};font-weight:700;">Edit below</div>
-            </div>
-            <div style="margin-top:8px;">{pills if pills else f"<span class='small-muted'>No indicators selected yet.</span>"}</div>
-        </div>
-    """
-    st.markdown(summary_html, unsafe_allow_html=True)
-
-    with st.expander("Edit indicators", expanded=(len(current) == 0)):
-        c1, c2 = st.columns([1.3, 1])
-        with c1:
-            st.markdown(
-                f"<div style='font-size:12px;font-weight:800;color:{TEXT};margin:0 0 6px;'>Choose your basket</div>",
-                unsafe_allow_html=True
-            )
-        with c2:
-            st.text_input("Search", key="shared_search_input", placeholder="Search indicators...", label_visibility="collapsed")
-
-        query = st.session_state.shared_search_input.strip().lower()
-        visible_options = [x for x in all_indicator_names if not query or query in x.lower()]
-        if not visible_options:
-            visible_options = all_indicator_names
-
-        c1, c2, c3, c4 = st.columns([1.3, 0.8, 0.8, 0.7])
-        with c1:
-            if st.button("Froth Defaults", key="picker_defaults", use_container_width=True):
-                set_combo_selection(["Shiller CAPE", "Tobin Q", "Buffet Indicator", "Equity Risk Premium"], all_indicator_names)
-                st.experimental_rerun()
-        with c2:
-            if st.button("Top 2", key="picker_top2", use_container_width=True):
-                cur = get_combo_selected()
-                set_combo_selection(cur[:2] if cur else ["Shiller CAPE", "Tobin Q"], all_indicator_names)
-                st.experimental_rerun()
-        with c3:
-            if st.button("Top 4", key="picker_top4", use_container_width=True):
-                cur = get_combo_selected()
-                set_combo_selection(cur[:4] if cur else ["Shiller CAPE", "Tobin Q", "Buffet Indicator", "Equity Risk Premium"], all_indicator_names)
-                st.experimental_rerun()
-        with c4:
-            if st.button("Clear", key="picker_clear", use_container_width=True):
-                set_combo_selection([], all_indicator_names)
-                st.experimental_rerun()
-
-        current = get_combo_selected()
-        st.markdown(
-            f"<div class='small-muted' style='font-weight:700;margin:8px 0 6px;'>Browse indicators</div>",
-        unsafe_allow_html=True
-        )
-        checkbox_cols = st.columns(3)
-        updated_selection = list(current)
-        for idx, name in enumerate(visible_options):
-            key = f"indicator_checkbox_{name}"
-            checked_now = name in current
-            col = checkbox_cols[idx % 3]
-            with col:
-                checked = st.checkbox(name, value=checked_now, key=key)
-            if checked and name not in updated_selection:
-                updated_selection.append(name)
-            if not checked and name in updated_selection:
-                updated_selection.remove(name)
-
-        if updated_selection != current:
-            set_combo_selection(updated_selection, all_indicator_names)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 7. REGIME HELPER
-# ══════════════════════════════════════════════════════════════════════════════
-def render_tab_intro(title, body):
-    st.markdown(
-        f"""
-        <div class="info-card" style="margin-top:2px;margin-bottom:14px;">
-            <div style="font-size:12px;font-weight:800;color:{TEXT};margin-bottom:4px;">{title}</div>
-            <div style="font-size:12px;color:{MUTED};line-height:1.45;">{body}</div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-
-def get_regime_mask(technicals, merged_df, mode):
-    if mode == "all" or "Price" not in technicals.columns:
-        return pd.Series(True, index=merged_df.index)
-
-    tech = technicals[["Date", "Price", "SMA200"]].dropna().copy()
-    tech["Date"] = pd.to_datetime(tech["Date"], errors="coerce", utc=True).dt.tz_localize(None)
-    tech = tech.sort_values("Date")
-    tech["bull"] = tech["Price"] > tech["SMA200"]
-
-    aligned = pd.merge_asof(
-        merged_df[["Date"]].reset_index(),
-        tech[["Date", "bull"]],
-        on="Date",
-        direction="backward"
-    ).set_index("index")["bull"].fillna(True)
-
-    return aligned if mode == "bull" else ~aligned
-
-
-def _apply_rule(flag_df, selected, rule, n, composite_scores=None, q=None):
-    tail_count = flag_df[selected].sum(axis=1)
-    if rule == "all":
-        return tail_count == len(selected), "All selected indicators in tail"
-    elif rule == "any":
-        return tail_count >= 1, "Any selected indicator in tail"
-    elif rule == "at_least_n":
-        return tail_count >= n, f"At least {n} indicators in tail"
-    else:
-        return composite_scores >= q, "Composite percentile score"
-
-
-def mask_to_periods(dates, mask):
-    dates = pd.to_datetime(pd.Series(dates)).reset_index(drop=True)
-    mask = pd.Series(mask).fillna(False).astype(bool).reset_index(drop=True)
-    periods = []
-    start = None
-    prev_date = None
-
-    for date_val, is_on in zip(dates, mask):
-        if is_on and start is None:
-            start = date_val
-        if not is_on and start is not None:
-            periods.append((start, prev_date))
-            start = None
-        prev_date = date_val
-
-    if start is not None and prev_date is not None:
-        periods.append((start, prev_date))
-
-    return periods
-
-
-def mask_to_starts(dates, mask):
-    dates = pd.to_datetime(pd.Series(dates)).reset_index(drop=True)
-    mask = pd.Series(mask).fillna(False).astype(bool).reset_index(drop=True)
-    starts = []
-    prev_on = False
-
-    for date_val, is_on in zip(dates, mask):
-        if is_on and not prev_on:
-            starts.append(date_val)
-        prev_on = is_on
-
-    return starts
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 8. PAGES
-# ══════════════════════════════════════════════════════════════════════════════
 def render_indicator_page(indicators, spx_c):
     st.subheader("Indicator Analysis")
     render_tab_intro(
@@ -2641,338 +1799,6 @@ def render_recession_page(indicators, spx_c):
     st.markdown("".join(blocks), unsafe_allow_html=True)
 
 
-def render_predictor_page(indicators, spx_c):
-    st.subheader("Downturn Predictor Search")
-    render_tab_intro(
-        "How this works",
-        "Selected indicators are first aligned to the SPX history and converted into expanding percentile signals, so each date is ranked only against information available up to that date. "
-        "Downturn trigger defines what size future selloff counts as the event to predict, and Predict window defines how far ahead the model looks for that event. "
-        "The tab then compares three approaches: Walk Forward tests simple average baskets, Random Forest builds an ensemble classifier, and Decision Tree builds a smaller rule-based classifier that is easier to inspect."
-    )
-    render_shared_indicator_picker(sorted(indicators.keys()))
-    selected = get_combo_selected()
-
-    with st.expander("ℹ️ How to use this tab", expanded=False):
-        st.markdown("""
-        - **Selected indicators** – These are the raw signals the tab turns into expanding percentile features. The same basket is used by all three models.
-        - **Downturn trigger** – This is the future selloff size the models try to warn about. A higher value means fewer but more severe target events.
-        - **Predict window (Y)** – A date is labeled positive if a downturn of that size begins within this many years after the date. A longer window usually increases recall and lowers precision.
-        - **Walk Forward model** – A simple basket model. It averages selected percentile signals and checks whether the basket fired before later downturns across rolling folds.
-        - **Random Forest model** – An ensemble of many small trees. It is usually the most stable nonlinear model here, but hardest to interpret rule by rule.
-        - **Decision Tree model** – A single small tree. It is less stable than the forest, but much easier to understand because you can inspect the exact split rules.
-        - **Mean Precision / Mean Recall / Mean F1** – These are averaged over walk-forward folds, so they reflect out-of-sample behavior rather than one static backtest window.
-        - **Mean Lead (days)** – Average number of days between the first warning and the later downturn event for warnings that were counted as successful.
-        """)
-
-    if not selected:
-        st.warning("Select at least one indicator.")
-        return
-
-    dd_thresh = st.slider("Downturn trigger", 0.10, 0.40, 0.20, 0.01, key="pred_trigger")
-    horizon = st.slider("Predict window (Y)", 0.25, 3.0, 1.0, 0.25, key="pred_horizon")
-    master_ds = build_selected_master_dataset(
-        indicators=indicators,
-        spx_c=spx_c,
-        selected=selected,
-        drawdown_threshold=float(dd_thresh),
-        lead_days=int(round(float(horizon) * 252))
-    )
-    wf_agg, wf_folds = run_walk_forward_search_cached(
-        master_ds=master_ds.to_dict("list"),
-        selected=tuple(selected),
-        horizon_years=float(horizon),
-        max_combo_size=min(4, len(selected))
-    )
-    ml_master = build_percentile_feature_master(master_ds.to_dict("list"), tuple(selected))
-    rf_results = run_ml_search_cached(
-        master_ds=ml_master.to_dict("list"),
-        selected=tuple(selected),
-        horizon_years=float(horizon),
-        max_combo_size=min(3, len(selected)),
-        model_type="random_forest"
-    )
-    dt_results = run_ml_search_cached(
-        master_ds=ml_master.to_dict("list"),
-        selected=tuple(selected),
-        horizon_years=float(horizon),
-        max_combo_size=min(3, len(selected)),
-        model_type="decision_tree"
-    )
-    predictor_tabs = st.tabs(["Walk Forward Model", "Random Forest Model", "Decision Tree Model"])
-
-    with predictor_tabs[0]:
-        st.markdown(
-            """
-            <div class="info-card">
-                <div style="font-size:12px;font-weight:800;color:#0f172a;margin-bottom:4px;">Walk Forward model</div>
-                <div style="font-size:12px;color:#64748b;line-height:1.45;">
-                    This is the simplest and most transparent approach on the page. For each fold, the app converts the selected indicators into percentile signals, averages them into a basket score, fits an alert threshold using only training data, and then tests whether that basket warned early enough before later downturns in the next holdout fold.
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-        if wf_agg.empty:
-            st.info("Walk-forward search did not produce enough valid folds for the current settings.")
-        else:
-            best_wf = wf_agg.iloc[0]
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Best walk-forward combo", best_wf["combo"], f"Mean F1: {best_wf['mean_f1']:.3f}")
-            c2.metric("Mean recall", f"{best_wf['mean_rec']:.1%}", f"Mean precision: {best_wf['mean_prec']:.1%}")
-            c3.metric("Mean lead", f"{best_wf['mean_lead']:.0f} days", f"Across {int(best_wf['n_folds'])} folds")
-            st.dataframe(
-                wf_agg.head(20).rename(columns={
-                    "combo": "Combo",
-                    "mean_f1": "Mean F1",
-                    "mean_rec": "Mean Recall",
-                    "mean_prec": "Mean Precision",
-                    "mean_lead": "Mean Lead (days)",
-                    "mean_score": "Mean Score",
-                    "n_folds": "Folds",
-                    "size": "Size"
-                }),
-                use_container_width=True
-            )
-            with st.expander("Fold-level walk-forward results", expanded=False):
-                st.dataframe(
-                    wf_folds.rename(columns={
-                        "combo": "Combo",
-                        "fold": "Fold",
-                        "size": "Size",
-                        "f1": "F1",
-                        "recall": "Recall",
-                        "prec": "Precision",
-                        "avg_lead": "Avg Lead (days)",
-                        "score": "Score"
-                    }),
-                    use_container_width=True
-                )
-
-    def render_model_results(results, model_label, model_body, show_tree_view=False, tree_master_ds=None, tree_selected=None, tree_horizon=None):
-        st.markdown(
-            f"""
-            <div class="info-card">
-                <div style="font-size:12px;font-weight:800;color:#0f172a;margin-bottom:4px;">{model_label}</div>
-                <div style="font-size:12px;color:#64748b;line-height:1.45;">{model_body}</div>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-        if results["single_summary"].empty and results["combo_summary"].empty:
-            st.info(f"{model_label} did not produce enough valid folds for the current settings.")
-            return
-
-        if pd.notna(results["eval_start"]) and pd.notna(results["eval_end"]):
-            st.markdown(
-                f"""
-                <div class="info-card">
-                    <div style="font-size:12px;font-weight:800;color:{TEXT};margin-bottom:4px;">Walk-forward evaluation window</div>
-                    <div style="font-size:12px;color:{MUTED};line-height:1.45;">
-                        {pd.Timestamp(results["eval_start"]).strftime("%Y-%m-%d")} to {pd.Timestamp(results["eval_end"]).strftime("%Y-%m-%d")}
-                        · realized downturns across folds: {results["n_realized_events"]}
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-
-        tab_names = ["Singles", "Individual Combos", "Augmented Combos", "Fold Detail"]
-        if show_tree_view:
-            tab_names.append("Tree View")
-        ml_tabs = st.tabs(tab_names)
-
-        with ml_tabs[0]:
-            if results["single_summary"].empty:
-                st.info("No single-indicator results available.")
-            else:
-                st.dataframe(
-                    results["single_summary"].head(20).rename(columns={
-                        "indicator": "Indicator",
-                        "mean_test_precision": "Mean Precision",
-                        "mean_test_recall": "Mean Recall",
-                        "mean_test_f1": "Mean F1",
-                        "mean_test_avg_lead": "Mean Lead (days)",
-                        "mean_n_caught": "Mean Crises Caught",
-                        "n_folds": "Folds"
-                    }),
-                    use_container_width=True
-                )
-
-        with ml_tabs[1]:
-            if results["individual_combo_table"].empty:
-                st.info("No individual combo table was produced for the current settings.")
-            else:
-                st.dataframe(
-                    results["individual_combo_table"].rename(columns={
-                        "combo": "Combo",
-                        "precision": "Precision",
-                        "recall": "Recall",
-                        "f1": "F1",
-                        "avg_lead": "Avg Lead (days)",
-                        "n_triggers": "Triggers",
-                        "n_crises": "Crises",
-                        "n_caught": "Crises Caught"
-                    }),
-                    use_container_width=True
-                )
-
-        with ml_tabs[2]:
-            if results["augmented_combo_table"].empty:
-                st.info("No augmented combo table was produced from the selected indicators.")
-            else:
-                st.dataframe(
-                    results["augmented_combo_table"].rename(columns={
-                        "base_combo": "Base Combo",
-                        "augmenter": "Augmenter",
-                        "augmented_combo": "Augmented Combo",
-                        "precision": "Precision",
-                        "recall": "Recall",
-                        "f1": "F1",
-                        "avg_lead": "Avg Lead (days)",
-                        "n_triggers": "Triggers",
-                        "n_crises": "Crises",
-                        "n_caught": "Crises Caught"
-                    }),
-                    use_container_width=True
-                )
-
-        with ml_tabs[3]:
-            if results["combo_summary"].empty:
-                st.info("No combo-level results available.")
-            else:
-                st.dataframe(
-                    results["combo_summary"].head(20).rename(columns={
-                        "combo": "Combo",
-                        "size": "Size",
-                        "mean_test_precision": "Mean Precision",
-                        "mean_test_recall": "Mean Recall",
-                        "mean_test_f1": "Mean F1",
-                        "mean_test_avg_lead": "Mean Lead (days)",
-                        "mean_n_caught": "Mean Crises Caught",
-                        "n_folds": "Folds"
-                    }),
-                    use_container_width=True
-                )
-                with st.expander("Fold-level combo results", expanded=False):
-                    st.dataframe(
-                        results["combo_fold_results"].rename(columns={
-                            "combo": "Combo",
-                            "size": "Size",
-                            "fold": "Fold",
-                            "test_precision": "Precision",
-                            "test_recall": "Recall",
-                            "test_f1": "F1",
-                            "test_avg_lead": "Avg Lead (days)",
-                            "n_caught": "Crises Caught"
-                        }),
-                        use_container_width=True
-                    )
-
-        if show_tree_view:
-            with ml_tabs[4]:
-                combo_options = results["combo_summary"]["combo"].head(12).tolist() if not results["combo_summary"].empty else []
-                if combo_options:
-                    default_idx = 0
-                    for idx, combo_name in enumerate(combo_options):
-                        if " + " in combo_name:
-                            default_idx = idx
-                            break
-                    chosen_combo = st.selectbox(
-                        "Combo to inspect",
-                        combo_options,
-                        index=default_idx,
-                        key="decision_tree_combo_inspect"
-                    )
-                else:
-                    chosen_combo = None
-
-                tree_details = (
-                    build_decision_tree_details_cached(tree_master_ds, tree_selected, tree_horizon, chosen_combo)
-                    if chosen_combo and tree_master_ds is not None and tree_selected is not None and tree_horizon is not None
-                    else None
-                )
-                if not tree_details:
-                    st.info("No decision-tree visualization was produced for the current settings.")
-                else:
-                    st.markdown(
-                        """
-                        <div class="info-card">
-                            <div style="font-size:12px;font-weight:800;color:#0f172a;margin-bottom:4px;">How the tree separates downturn risk</div>
-                            <div style="font-size:12px;color:#64748b;line-height:1.45;">
-                                The chart below shows the chosen decision-tree combo on the latest walk-forward fold. Feature importance is normalized, so the values sum to 1 across the features actually used by that tree. The purple line is the predicted downturn probability, the dashed red line is the alert threshold, and red markers show dates inside actual downturn-warning windows.
-                            </div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
-
-                    imp_df = pd.DataFrame(tree_details["importance"])
-                    if not imp_df.empty:
-                        fig_imp = go.Figure()
-                        fig_imp.add_trace(go.Bar(
-                            x=imp_df["importance"].astype(float).tolist(),
-                            y=imp_df["feature"].tolist(),
-                            orientation="h",
-                            marker=dict(color=ORANGE),
-                            hovertemplate="<b>%{y}</b><br>Importance: %{x:.3f}<extra></extra>"
-                        ))
-                        apply_layout(fig_imp, f"Decision tree feature importance — {tree_details['combo']}", 300)
-                        fig_imp.update_xaxes(title="Importance")
-                        fig_imp.update_yaxes(title="", autorange="reversed")
-                        st.plotly_chart(fig_imp, use_container_width=True)
-
-                    test_view = pd.DataFrame(tree_details["test_view"])
-                    if not test_view.empty:
-                        fig_prob = go.Figure()
-                        fig_prob.add_trace(go.Scatter(
-                            x=pd.to_datetime(test_view["Date"]).tolist(),
-                            y=pd.to_numeric(test_view["probability"]).astype(float).tolist(),
-                            mode="lines",
-                            name="Predicted probability",
-                            line=dict(color=PURPLE, width=2)
-                        ))
-                        pos = test_view[test_view["target_downturn"] == 1]
-                        if not pos.empty:
-                            fig_prob.add_trace(go.Scatter(
-                                x=pd.to_datetime(pos["Date"]).tolist(),
-                                y=pd.to_numeric(pos["probability"]).astype(float).tolist(),
-                                mode="markers",
-                                name="Actual downturn window",
-                                marker=dict(color=RED, size=8)
-                            ))
-                        fig_prob.add_hline(
-                            y=float(tree_details["threshold"]),
-                            line_dash="dot",
-                            line_color=RED,
-                            annotation_text=f"Alert threshold: {tree_details['threshold']:.2f}",
-                            annotation_position="top right"
-                        )
-                        apply_layout(fig_prob, f"Decision tree separation on latest fold — fold {tree_details['fold']}", 360)
-                        fig_prob.update_yaxes(title="Predicted probability", range=[0, 1])
-                        st.plotly_chart(fig_prob, use_container_width=True)
-
-                    with st.expander("Decision tree rules", expanded=False):
-                        st.code(tree_details["rules_text"], language="text")
-
-    with predictor_tabs[1]:
-        render_model_results(
-            rf_results,
-            "Random Forest model",
-            "Random Forest combines many shallow trees and averages them. In this tab it is still evaluated in walk-forward fashion across the valid folds, so it is not just training on one late period like a static backtest would. It is usually more stable than a single tree, captures nonlinear interactions between indicators, and tends to smooth out noisy one-off splits, but the final signal is harder to interpret rule by rule.",
-            show_tree_view=False
-        )
-
-    with predictor_tabs[2]:
-        render_model_results(
-            dt_results,
-            "Decision Tree model",
-            "Decision Tree uses one compact set of split rules. In this tab it is also evaluated across the walk-forward folds, but unlike the forest you can inspect the actual branching logic that turned indicator percentiles into higher or lower downturn risk. That makes it useful when you want a model that is easier to explain, even if it is usually less robust than the forest.",
-            show_tree_view=True,
-            tree_master_ds=ml_master.to_dict("list"),
-            tree_selected=tuple(selected),
-            tree_horizon=float(horizon)
-        )
 
 
 
@@ -3011,22 +1837,23 @@ def main():
     all_indicator_names = sorted(indicators.keys())
     init_state(all_indicator_names)
 
-    page = st.radio(
-        "View",
-        ["Indicator Analysis", "SPX Technicals", "Tail Combo", "Downturn Predictor Search"],
-        horizontal=True,
-        key="page_selector",
-        label_visibility="collapsed"
-    )
+    page_options = ["Indicator Analysis", "SPX Technicals", "Tail Combo"]
+    nav_left, nav_center, nav_right = st.columns([1.2, 6, 1.2])
+    with nav_center:
+        page = st.radio(
+            "View",
+            page_options,
+            horizontal=True,
+            key="page_selector",
+            label_visibility="collapsed"
+        )
 
     if page == "Indicator Analysis":
         render_indicator_page(indicators, spx_c)
     elif page == "SPX Technicals":
         render_tech_page(spx_c, technicals)
-    elif page == "Tail Combo":
-        render_combo_page(indicators, spx_c, technicals)
     else:
-        render_predictor_page(indicators, spx_c)
+        render_combo_page(indicators, spx_c, technicals)
 
 
 if __name__ == "__main__":
